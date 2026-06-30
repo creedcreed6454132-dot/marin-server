@@ -30,6 +30,7 @@ const DEFAULTS = {
   fast: 9, slow: 21, rsiP: 14, rsiBuy: 30, rsiSell: 70, bbP: 20, bbStd: 2, brk: 20,
   tradeSize: 1000, sl: 2, tp: 4, trail: 1.5,
   scanSec: 30, dailyLossLimitPct: 5,
+  maxHoldMin: 120,            // force-close a position after this many minutes (0 = off)
   maxLiveUsd: 25,
   watchlist: ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT", "ADAUSDT", "LINKUSDT", "LTCUSDT", "AVAXUSDT"]
 };
@@ -168,19 +169,28 @@ async function scan() {
     WATCH = statuses; save();
     if (ok === 0) { log("No market data (all sources failed)"); scanning = false; return; }
 
-    const eqNow = equity(heldPrice);
-    checkDaily(eqNow);
-
     // manage an open position (exits run even if Auto-Trade is paused, for safety)
-    if (heldSym && heldPrice) {
-      SERIES.symbol = heldSym; SERIES.points.push({ ts: Date.now(), price: heldPrice }); if (SERIES.points.length > 300) SERIES.points = SERIES.points.slice(-300);
-      const e = P.position.entry;
-      P.position.peak = Math.max(P.position.peak || e, heldPrice);
-      if (S.trail > 0 && heldPrice <= P.position.peak * (1 - S.trail / 100) && heldPrice > e * (1 - S.sl / 100)) await closeTrade(heldPrice, "trailing-stop");
-      else if (heldPrice <= e * (1 - S.sl / 100)) await closeTrade(heldPrice, "stop-loss");
-      else if (heldPrice >= e * (1 + S.tp / 100)) await closeTrade(heldPrice, "take-profit");
-      else if (heldCloses && heldCloses.length >= needHist()) { const d = decide(heldCloses, heldPrice); if (d.verdict === "sell" && d.sell >= S.consensusMin) await closeTrade(heldPrice, "signal"); }
-      save(); scanning = false; return;
+    if (heldSym) {
+      // Guarantee we have a price: use the scan result, else fetch the held coin directly.
+      let price = heldPrice;
+      if (price == null) { const c = await fetchCloses(heldSym); if (c && c.length) { heldCloses = c; price = c[c.length - 1]; } }
+      checkDaily(equity(price));
+      if (price != null) {
+        SERIES.symbol = heldSym; SERIES.points.push({ ts: Date.now(), price }); if (SERIES.points.length > 300) SERIES.points = SERIES.points.slice(-300);
+        const e = P.position.entry;
+        P.position.peak = Math.max(P.position.peak || e, price);
+        const heldMin = (Date.now() - (P.position.entryTs || Date.now())) / 60000;
+        if (S.maxHoldMin > 0 && heldMin >= S.maxHoldMin) await closeTrade(price, "max-hold");
+        else if (S.trail > 0 && price <= P.position.peak * (1 - S.trail / 100) && price > e * (1 - S.sl / 100)) await closeTrade(price, "trailing-stop");
+        else if (price <= e * (1 - S.sl / 100)) await closeTrade(price, "stop-loss");
+        else if (price >= e * (1 + S.tp / 100)) await closeTrade(price, "take-profit");
+        else if (heldCloses && heldCloses.length >= needHist()) { const d = decide(heldCloses, price); if (d.verdict === "sell" && d.sell >= S.consensusMin) await closeTrade(price, "signal"); }
+        save();
+      } else {
+        log("Holding " + heldSym + " but no price from any source");
+        say(`I'm holding ${heldSym} but can't fetch its price to manage the exit — tap Sell now. 🌐`, "worried");
+      }
+      scanning = false; return;
     }
 
     // open a new position
@@ -206,7 +216,7 @@ function state() {
   };
 }
 function applySettings(patch) {
-  const nums = ["consensusMin", "fast", "slow", "rsiP", "rsiBuy", "rsiSell", "bbP", "bbStd", "tradeSize", "sl", "tp", "trail", "scanSec", "dailyLossLimitPct", "maxLiveUsd", "brk"];
+  const nums = ["consensusMin", "fast", "slow", "rsiP", "rsiBuy", "rsiSell", "bbP", "bbStd", "tradeSize", "sl", "tp", "trail", "scanSec", "dailyLossLimitPct", "maxLiveUsd", "maxHoldMin", "brk"];
   for (const k of nums) if (k in patch && isFinite(+patch[k])) S[k] = +patch[k];
   if ("strategy" in patch && STRATS.includes(patch.strategy)) S.strategy = patch.strategy;
   if ("requireConsensus" in patch) S.requireConsensus = !!patch.requireConsensus;
@@ -291,6 +301,7 @@ pre{white-space:pre-wrap;font-size:11px;color:#8a93a2;max-height:150px;overflow:
 <div><label>Consensus min</label><input id="consensusMin" type="number"></div>
 <div><label>Scan sec</label><input id="scanSec" type="number"></div>
 <div><label>Daily loss %</label><input id="dailyLossLimitPct" type="number" step="0.1"></div>
+<div><label>Max hold min</label><input id="maxHoldMin" type="number"></div>
 <div><label>Max live $</label><input id="maxLiveUsd" type="number"></div>
 <div><label>Fast MA</label><input id="fast" type="number"></div>
 <div><label>Slow MA</label><input id="slow" type="number"></div>
@@ -310,7 +321,7 @@ function setFace(m){const i=F[m]||F.neutral;const svg='<svg xmlns="http://www.w3
 let lastSaid=0,voiceOn=false,cur={};
 document.body.addEventListener('click',()=>{voiceOn=true},{once:true});
 function speak(t){if(!voiceOn||!window.speechSynthesis)return;try{speechSynthesis.cancel();const u=new SpeechSynthesisUtterance(t);u.rate=.95;u.pitch=1.15;const v=speechSynthesis.getVoices().find(x=>/female|aria|jenny|zira|samantha/i.test(x.name));if(v)u.voice=v;speechSynthesis.speak(u);}catch(e){}}
-function fill(s){cur=s.settings;['tradeSize','sl','tp','trail','consensusMin','scanSec','dailyLossLimitPct','maxLiveUsd','fast','slow','rsiP','brk'].forEach(k=>{if(document.activeElement.id!==k)document.getElementById(k).value=s.settings[k];});document.getElementById('strategy').value=s.settings.strategy;document.getElementById('requireConsensus').checked=s.settings.requireConsensus;if(document.activeElement.id!=='watchlist')document.getElementById('watchlist').value=s.settings.watchlist.join(', ');document.getElementById('auto').textContent=s.settings.autoTrade?'⏸ Pause':'▶ Start';document.getElementById('auto').style.background=s.settings.autoTrade?'#c62828':'#2e7d32';}
+function fill(s){cur=s.settings;['tradeSize','sl','tp','trail','consensusMin','scanSec','dailyLossLimitPct','maxHoldMin','maxLiveUsd','fast','slow','rsiP','brk'].forEach(k=>{if(document.activeElement.id!==k)document.getElementById(k).value=s.settings[k];});document.getElementById('strategy').value=s.settings.strategy;document.getElementById('requireConsensus').checked=s.settings.requireConsensus;if(document.activeElement.id!=='watchlist')document.getElementById('watchlist').value=s.settings.watchlist.join(', ');document.getElementById('auto').textContent=s.settings.autoTrade?'⏸ Pause':'▶ Start';document.getElementById('auto').style.background=s.settings.autoTrade?'#c62828':'#2e7d32';}
 async function load(){const s=await(await fetch('/state')).json();
 document.getElementById('mode').textContent='('+s.mode+')';
 document.getElementById('halt').style.display=s.halted?'block':'none';
@@ -328,7 +339,7 @@ if(!document.getElementById('tradeSize').value)fill(s);else fill(s);}
 async function act(w){await fetch('/api/'+w,{method:'POST'});load();}
 async function resume(){await fetch('/api/resume',{method:'POST'});load();}
 async function toggleAuto(){await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({autoTrade:!cur.autoTrade})});load();}
-async function saveS(){const b={tradeSize:+v('tradeSize'),sl:+v('sl'),tp:+v('tp'),trail:+v('trail'),consensusMin:+v('consensusMin'),scanSec:+v('scanSec'),dailyLossLimitPct:+v('dailyLossLimitPct'),maxLiveUsd:+v('maxLiveUsd'),fast:+v('fast'),slow:+v('slow'),rsiP:+v('rsiP'),brk:+v('brk'),strategy:v('strategy'),requireConsensus:document.getElementById('requireConsensus').checked,watchlist:v('watchlist')};await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});alert('Saved!');load();}
+async function saveS(){const b={tradeSize:+v('tradeSize'),sl:+v('sl'),tp:+v('tp'),trail:+v('trail'),consensusMin:+v('consensusMin'),scanSec:+v('scanSec'),dailyLossLimitPct:+v('dailyLossLimitPct'),maxHoldMin:+v('maxHoldMin'),maxLiveUsd:+v('maxLiveUsd'),fast:+v('fast'),slow:+v('slow'),rsiP:+v('rsiP'),brk:+v('brk'),strategy:v('strategy'),requireConsensus:document.getElementById('requireConsensus').checked,watchlist:v('watchlist')};await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});alert('Saved!');load();}
 function v(id){return document.getElementById(id).value;}
 setFace('happy');load();setInterval(load,4000);
 </script></body></html>`;
