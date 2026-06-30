@@ -1,0 +1,12 @@
+{
+  "name": "marin-server-bot",
+  "version": "1.0.0",
+  "description": "Marin 24/7 crypto paper-trading bot (Node, no dependencies)",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
