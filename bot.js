@@ -31,6 +31,8 @@ const DEFAULTS = {
   tradeSize: 1000, sl: 2, tp: 4, trail: 1.5,
   scanSec: 30, dailyLossLimitPct: 5,
   maxHoldMin: 120,            // force-close a position after this many minutes (0 = off)
+  selfLearn: true,            // review her own results and auto-tune her plan
+  avoid: [],                  // coins she's learned to skip (auto-managed)
   maxLiveUsd: 25,
   watchlist: ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT", "ADAUSDT", "LINKUSDT", "LTCUSDT", "AVAXUSDT"]
 };
@@ -51,9 +53,37 @@ try {
     SERIES = s.SERIES || SERIES; LOG = s.LOG || []; DAY = s.DAY || DAY; haltedToday = !!s.haltedToday;
   }
 } catch (e) { console.log("state load failed:", e.message); }
-function save() { try { fs.writeFileSync(STATE_FILE, JSON.stringify({ S, P, LEARN, WATCH, SERIES, LOG, DAY, haltedToday })); } catch (e) {} }
+function save() { try { fs.writeFileSync(STATE_FILE, JSON.stringify({ S, P, LEARN, WATCH, SERIES, LOG, DAY, haltedToday })); } catch (e) {} scheduleRemote(); }
 function log(m) { const l = `[${new Date().toISOString()}] ${m}`; console.log(l); LOG.unshift(l); LOG = LOG.slice(0, 120); }
 function say(text, mood) { SAYS = { text, mood: mood || "happy", ts: Date.now() }; }
+
+// ---------- persistent storage across restarts/redeploys (Upstash Redis REST) ----------
+const REDIS_URL = process.env.UPSTASH_REDIS_REST_URL || "";
+const REDIS_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || "";
+const REMOTE = !!(REDIS_URL && REDIS_TOKEN);
+let lastRemote = 0;
+async function redisCmd(cmd) {
+  const r = await fetch(REDIS_URL, { method: "POST", headers: { Authorization: "Bearer " + REDIS_TOKEN, "Content-Type": "application/json" }, body: JSON.stringify(cmd) });
+  const d = await r.json(); return d.result;
+}
+async function saveRemote() {
+  if (!REMOTE) return;
+  try { await redisCmd(["SET", "marin_state", JSON.stringify({ S, P, LEARN, DAY, haltedToday })]); lastRemote = Date.now(); }
+  catch (e) { log("remote save failed: " + e.message); }
+}
+function scheduleRemote() { if (REMOTE && Date.now() - lastRemote > 20000) { lastRemote = Date.now(); saveRemote(); } }
+async function loadRemote() {
+  if (!REMOTE) { log("No Redis configured — state is local only (resets on redeploy)."); return; }
+  try {
+    const v = await redisCmd(["GET", "marin_state"]);
+    if (v) {
+      const s = JSON.parse(v);
+      if (s.S) S = Object.assign({}, DEFAULTS, s.S);
+      P = s.P || P; LEARN = s.LEARN || LEARN; DAY = s.DAY || DAY; haltedToday = !!s.haltedToday;
+      log("✅ Loaded her saved learning from Redis (survives restarts).");
+    } else { log("Redis connected — no saved state yet, starting fresh."); }
+  } catch (e) { log("remote load failed: " + e.message); }
+}
 
 // ---------- indicators ----------
 const sma = (a, n) => a.length < n ? null : a.slice(-n).reduce((x, y) => x + y, 0) / n;
@@ -119,7 +149,7 @@ async function openTrade(sym, price) {
   const qty = sizeUsd / price;
   if (LIVE) { const r = await krakenOrder(sym, "buy", qty); if (r.error) { log("BUY aborted — live order failed."); return; } }
   P.position = { symbol: sym, qty, entry: price, peak: price, entryTs: Date.now() };
-  P.cash -= sizeUsd; save();
+  P.cash -= sizeUsd; save(); saveRemote();
   say(`Opening a ${LIVE ? "LIVE " : ""}BUY on ${sym} at ${price.toFixed(4)}! Stop-loss is on. 💖`, "excited");
   log(`${LIVE ? "LIVE " : ""}BUY ${sym} @ ${price.toFixed(4)} ($${sizeUsd.toFixed(0)})`);
 }
@@ -132,9 +162,42 @@ async function closeTrade(price, reason) {
   if (P.trades.length > 300) P.trades = P.trades.slice(-300);
   const L = LEARN[pos.symbol] || { wins: 0, losses: 0, pnl: 0 };
   pnl >= 0 ? L.wins++ : L.losses++; L.pnl += pnl; LEARN[pos.symbol] = L;
-  P.position = null; save();
+  P.position = null; save(); saveRemote();
   say(`Closed ${pos.symbol} for ${pnl >= 0 ? "+" : ""}${pnl.toFixed(2)} (${reason}). ${pnl >= 0 ? "A win! 🎉" : "Small loss — discipline over everything. 💪"}`, pnl >= 0 ? "excited" : "worried");
   log(`${LIVE ? "LIVE " : ""}SELL ${pos.symbol} @ ${price.toFixed(4)} | P&L ${pnl >= 0 ? "+" : ""}${pnl.toFixed(2)} (${reason})`);
+  selfOptimize();
+}
+
+// ---------- SELF-OPTIMIZE: use her own results to update her plan ----------
+// Honest scope: this biases toward what has worked and away from what has lost
+// on THIS account. It's curve-fitting to the recent past — it reduces obvious
+// mistakes, it does NOT predict the future or guarantee profit.
+function selfOptimize() {
+  if (!S.selfLearn) return;
+  const MINT = 6;                        // need this many trades on a coin to judge it
+  const avoid = [];
+  for (const sym of Object.keys(LEARN)) {
+    const L = LEARN[sym]; const t = L.wins + L.losses;
+    if (t >= MINT && L.pnl < 0 && (L.wins / t) < 0.4) avoid.push(sym);
+  }
+  const msgs = [];
+  const avoidChanged = JSON.stringify(avoid.sort()) !== JSON.stringify((S.avoid || []).slice().sort());
+  if (avoidChanged) { S.avoid = avoid; if (avoid.length) msgs.push("avoiding losers: " + avoid.join(", ")); else msgs.push("cleared the avoid-list"); }
+
+  // If she's clearly losing overall, get MORE selective (raise consensus, cap 5).
+  const tot = P.wins + P.losses;
+  if (tot >= 20) {
+    const wr = P.wins / tot;
+    if (wr < 0.45 && S.consensusMin < 5) { S.consensusMin++; msgs.push("raised consensus to " + S.consensusMin); }
+    // Nudge take-profit toward her real average win (kept in a sane 2–8% band).
+    const wins = P.trades.filter(t => t.pnl >= 0);
+    if (wins.length >= 8) {
+      const avgWinPct = wins.reduce((a, t) => a + (t.exit - t.entry) / t.entry * 100, 0) / wins.length;
+      const newTp = Math.min(8, Math.max(2, +avgWinPct.toFixed(1)));
+      if (Math.abs(newTp - S.tp) >= 0.5) { S.tp = newTp; msgs.push("take-profit → " + newTp + "%"); }
+    }
+  }
+  if (msgs.length) { save(); say("I studied my past trades and updated my plan: " + msgs.join("; ") + ". Always learning! 🧠✨", "excited"); log("SELF-OPTIMIZE: " + msgs.join("; ")); }
 }
 
 // ---------- daily loss auto-shutoff ----------
@@ -164,7 +227,8 @@ async function scan() {
       if (closes.length >= needHist()) d = decide(closes, price);
       statuses.push({ symbol: sym, price, verdict: d.verdict, buy: d.buy, sell: d.sell, held: sym === heldSym });
       if (sym === heldSym) { heldCloses = closes; heldPrice = price; }
-      if (!heldSym && (!best || d.buy > best.buy)) best = { sym, buy: d.buy, price };
+      // Skip coins she's learned to avoid when picking a new entry.
+      if (!heldSym && !(S.avoid || []).includes(sym) && (!best || d.buy > best.buy)) best = { sym, buy: d.buy, price };
     }
     WATCH = statuses; save();
     if (ok === 0) { log("No market data (all sources failed)"); scanning = false; return; }
@@ -221,6 +285,7 @@ function applySettings(patch) {
   if ("strategy" in patch && STRATS.includes(patch.strategy)) S.strategy = patch.strategy;
   if ("requireConsensus" in patch) S.requireConsensus = !!patch.requireConsensus;
   if ("autoTrade" in patch) S.autoTrade = !!patch.autoTrade;
+  if ("selfLearn" in patch) S.selfLearn = !!patch.selfLearn;
   if ("watchlist" in patch && typeof patch.watchlist === "string") S.watchlist = patch.watchlist.toUpperCase().split(/[\s,]+/).map(x => x.trim()).filter(Boolean);
   S.scanSec = Math.max(15, S.scanSec || 30);
   save(); restartTimer();
@@ -256,7 +321,12 @@ async function manualSell() {
 
 let timer = null;
 function restartTimer() { if (timer) clearInterval(timer); timer = setInterval(scan, S.scanSec * 1000); }
-scan(); restartTimer();
+// Load persisted learning first (if Redis is set), THEN start trading.
+(async () => {
+  await loadRemote();
+  scan(); restartTimer();
+  if (REMOTE) setInterval(saveRemote, 300000); // periodic backstop save every 5 min
+})();
 
 // ---------- dashboard HTML ----------
 const DASH = `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -310,6 +380,8 @@ pre{white-space:pre-wrap;font-size:11px;color:#8a93a2;max-height:150px;overflow:
 </div>
 <label>Strategy (when consensus off)</label><select id="strategy"><option>ema</option><option>ma</option><option>macd</option><option>rsi</option><option>bollinger</option><option>breakout</option></select>
 <label><input type="checkbox" id="requireConsensus" style="width:auto"> Require consensus (all 6)</label>
+<label><input type="checkbox" id="selfLearn" style="width:auto"> 🧠 Self-learn (auto-tune from her results)</label>
+<div id="avoid" style="font-size:12px;color:#ffb74d;margin-top:4px"></div>
 <label>Watchlist</label><textarea id="watchlist" rows="2"></textarea>
 <button class="btn" style="width:100%;margin-top:10px" onclick="saveS()">Save settings</button></div>
 
@@ -321,7 +393,8 @@ function setFace(m){const i=F[m]||F.neutral;const svg='<svg xmlns="http://www.w3
 let lastSaid=0,voiceOn=false,cur={};
 document.body.addEventListener('click',()=>{voiceOn=true},{once:true});
 function speak(t){if(!voiceOn||!window.speechSynthesis)return;try{speechSynthesis.cancel();const u=new SpeechSynthesisUtterance(t);u.rate=.95;u.pitch=1.15;const v=speechSynthesis.getVoices().find(x=>/female|aria|jenny|zira|samantha/i.test(x.name));if(v)u.voice=v;speechSynthesis.speak(u);}catch(e){}}
-function fill(s){cur=s.settings;['tradeSize','sl','tp','trail','consensusMin','scanSec','dailyLossLimitPct','maxHoldMin','maxLiveUsd','fast','slow','rsiP','brk'].forEach(k=>{if(document.activeElement.id!==k)document.getElementById(k).value=s.settings[k];});document.getElementById('strategy').value=s.settings.strategy;document.getElementById('requireConsensus').checked=s.settings.requireConsensus;if(document.activeElement.id!=='watchlist')document.getElementById('watchlist').value=s.settings.watchlist.join(', ');document.getElementById('auto').textContent=s.settings.autoTrade?'⏸ Pause':'▶ Start';document.getElementById('auto').style.background=s.settings.autoTrade?'#c62828':'#2e7d32';}
+function fill(s){cur=s.settings;['tradeSize','sl','tp','trail','consensusMin','scanSec','dailyLossLimitPct','maxHoldMin','maxLiveUsd','fast','slow','rsiP','brk'].forEach(k=>{if(document.activeElement.id!==k)document.getElementById(k).value=s.settings[k];});document.getElementById('strategy').value=s.settings.strategy;document.getElementById('requireConsensus').checked=s.settings.requireConsensus;document.getElementById('selfLearn').checked=s.settings.selfLearn;
+document.getElementById('avoid').textContent=(s.settings.avoid&&s.settings.avoid.length)?('🧠 Learned to avoid: '+s.settings.avoid.join(', ')):'';if(document.activeElement.id!=='watchlist')document.getElementById('watchlist').value=s.settings.watchlist.join(', ');document.getElementById('auto').textContent=s.settings.autoTrade?'⏸ Pause':'▶ Start';document.getElementById('auto').style.background=s.settings.autoTrade?'#c62828':'#2e7d32';}
 async function load(){const s=await(await fetch('/state')).json();
 document.getElementById('mode').textContent='('+s.mode+')';
 document.getElementById('halt').style.display=s.halted?'block':'none';
@@ -339,7 +412,7 @@ if(!document.getElementById('tradeSize').value)fill(s);else fill(s);}
 async function act(w){await fetch('/api/'+w,{method:'POST'});load();}
 async function resume(){await fetch('/api/resume',{method:'POST'});load();}
 async function toggleAuto(){await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({autoTrade:!cur.autoTrade})});load();}
-async function saveS(){const b={tradeSize:+v('tradeSize'),sl:+v('sl'),tp:+v('tp'),trail:+v('trail'),consensusMin:+v('consensusMin'),scanSec:+v('scanSec'),dailyLossLimitPct:+v('dailyLossLimitPct'),maxHoldMin:+v('maxHoldMin'),maxLiveUsd:+v('maxLiveUsd'),fast:+v('fast'),slow:+v('slow'),rsiP:+v('rsiP'),brk:+v('brk'),strategy:v('strategy'),requireConsensus:document.getElementById('requireConsensus').checked,watchlist:v('watchlist')};await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});alert('Saved!');load();}
+async function saveS(){const b={tradeSize:+v('tradeSize'),sl:+v('sl'),tp:+v('tp'),trail:+v('trail'),consensusMin:+v('consensusMin'),scanSec:+v('scanSec'),dailyLossLimitPct:+v('dailyLossLimitPct'),maxHoldMin:+v('maxHoldMin'),maxLiveUsd:+v('maxLiveUsd'),fast:+v('fast'),slow:+v('slow'),rsiP:+v('rsiP'),brk:+v('brk'),strategy:v('strategy'),requireConsensus:document.getElementById('requireConsensus').checked,selfLearn:document.getElementById('selfLearn').checked,watchlist:v('watchlist')};await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});alert('Saved!');load();}
 function v(id){return document.getElementById(id).value;}
 setFace('happy');load();setInterval(load,4000);
 </script></body></html>`;
