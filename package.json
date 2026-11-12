@@ -1,12 +1,25 @@
 {
   "name": "marin-server-bot",
   "version": "1.0.0",
-  "description": "Marin 24/7 crypto paper-trading bot (Node, no dependencies)",
+  "description": "Marin 24/7 crypto paper-trading bot + 10 AI agency agents (Node 18+)",
   "main": "bot.js",
   "scripts": {
-    "start": "node bot.js"
+    "start": "node bot.js",
+    "agent:onboarder": "node agents/onboarder.js",
+    "agent:offer-builder": "node agents/offer-builder.js",
+    "agent:copywriter": "node agents/copywriter.js",
+    "agent:creative-director": "node agents/creative-director.js",
+    "agent:page-writer": "node agents/page-writer.js",
+    "agent:media-buyer": "node agents/media-buyer.js",
+    "agent:speed-to-lead": "node agents/speed-to-lead.js",
+    "agent:analyst": "node agents/analyst.js",
+    "agent:account-manager": "node agents/account-manager.js",
+    "agent:renewal-rep": "node agents/renewal-rep.js"
   },
   "engines": {
     "node": ">=18"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^1.8.0"
   }
 }
